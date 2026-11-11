@@ -8,7 +8,7 @@ needs a proxy — see [Firmware downloads](#firmware-downloads).
 
 ## Run
 
-Hosted: **https://jlpoltrack.github.io/AP-Web-Tools/ap-updater/** — pushes to `main` redeploy it.
+Hosted: **https://jlpoltrack.github.io/Tools-APWeb/ap-updater/** — pushes to `main` redeploy it.
 
 Locally:
 

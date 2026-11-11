@@ -2,7 +2,7 @@
 
 Browser tools for ArduPilot hardware, using Web Serial (Chromium desktop browsers).
 
-Hosted: **https://jlpoltrack.github.io/AP-Web-Tools/** — one page, one tab per tool. Pushes to `main` redeploy it.
+Hosted: **https://jlpoltrack.github.io/Tools-APWeb/** — one page, one tab per tool. Pushes to `main` redeploy it.
 
 | Tab | Folder | What it does |
 |---|---|---|
