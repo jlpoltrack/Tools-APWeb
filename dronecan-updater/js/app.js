@@ -1,6 +1,7 @@
 import { SLCAN } from './slcan.js';
 import * as mav from './mavlink.js';
-import { DTID, SVC, SIG, messageId, serviceId, parseId, packTransfer, transferCrc, Reassembler } from './dronecan.js';
+import { DTID, SVC, SIG, messageId, serviceId, parseId, packTransfer, transferCrc, encodeReadResponse,
+         encodeBeginFirmwareUpdate, decodeBeginFirmwareUpdateResponse, Reassembler } from './dronecan.js';
 
 const READ_CHUNK = 256;
 const MODE_NAMES = ['OPERATIONAL', 'INIT', 'MAINTENANCE', 'SOFTWARE_UPDATE', '4', '5', '6', 'OFFLINE'];
@@ -57,8 +58,8 @@ function nextTransferId(key) {
   return n;
 }
 
-async function sendTransfer(canId, payload, transferId, signature) {
-  await state.slcan.sendFrames(packTransfer(canId, payload, transferId, signature));
+async function sendTransfer(canId, payload, transferId, signature, fd = false) {
+  await state.slcan.sendFrames(packTransfer(canId, payload, transferId, signature, fd));
 }
 
 // ---------- outgoing messages ----------
@@ -78,43 +79,40 @@ async function requestNodeInfo(nodeId) {
   await sendTransfer(id, new Uint8Array(0), nextTransferId('gni' + nodeId), SIG.GET_NODE_INFO);
 }
 
+// Sent in CAN FD to a node that broadcasts in FD: a node may answer in the format it last
+// received, and a first classic read reply (38 frames) overruns the FC's CAN TX FIFO
 async function beginFirmwareUpdate(nodeId, path) {
-  const pathBytes = new TextEncoder().encode(path);
-  const p = new Uint8Array(1 + pathBytes.length);
-  p[0] = state.ourNodeId;
-  p.set(pathBytes, 1);
+  const fd = !!state.nodes.get(nodeId)?.fd;
+  const p = encodeBeginFirmwareUpdate(state.ourNodeId, new TextEncoder().encode(path), fd);
   const id = serviceId(20, SVC.BEGIN_FIRMWARE_UPDATE, true, nodeId, state.ourNodeId);
-  await sendTransfer(id, p, nextTransferId('bfu' + nodeId), SIG.BEGIN_FIRMWARE_UPDATE);
+  await sendTransfer(id, p, nextTransferId('bfu' + nodeId), SIG.BEGIN_FIRMWARE_UPDATE, fd);
 }
 
-async function sendReadResponse(destNode, transferId, errorCode, chunk) {
-  const p = new Uint8Array(2 + chunk.length);
-  p[0] = errorCode & 0xff;
-  p[1] = (errorCode >> 8) & 0xff;
-  p.set(chunk, 2);
+// Answered in the request's frame format: an FD reply is 5 frames per 256-byte chunk, not 38
+async function sendReadResponse(destNode, transferId, errorCode, chunk, fd) {
   const id = serviceId(20, SVC.FILE_READ, false, destNode, state.ourNodeId);
-  await sendTransfer(id, p, transferId, SIG.FILE_READ);
+  await sendTransfer(id, encodeReadResponse(errorCode, chunk, fd), transferId, SIG.FILE_READ, fd);
 }
 
 // ---------- incoming ----------
 
-function onFrame(id, data, extended) {
+function onFrame(id, data, extended, fd = false) {
   if (!extended) return;
-  const res = state.reasm.push(id, data);
+  const res = state.reasm.push(id, data, fd);
   if (!res) return;
   const h = parseId(id);
   if (h.service) {
     if (h.dest !== state.ourNodeId) return;
     const tid = data[data.length - 1] & 0x1f;
-    if (h.serviceTypeId === SVC.FILE_READ && h.request) handleReadRequest(h, res.payload, tid);
-    else if (h.serviceTypeId === SVC.BEGIN_FIRMWARE_UPDATE && !h.request) handleBfuResponse(h, res.payload);
+    if (h.serviceTypeId === SVC.FILE_READ && h.request) handleReadRequest(h, res.payload, tid, res.fd);
+    else if (h.serviceTypeId === SVC.BEGIN_FIRMWARE_UPDATE && !h.request) handleBfuResponse(h, res.payload, res.fd);
     else if (h.serviceTypeId === SVC.GET_NODE_INFO && !h.request) handleNodeInfo(h, res);
   } else if (h.dtid === DTID.NODE_STATUS) {
-    handleNodeStatus(h, res.payload);
+    handleNodeStatus(h, res.payload, res.fd);
   }
 }
 
-function handleNodeStatus(h, p) {
+function handleNodeStatus(h, p, fd) {
   if (p.length < 7 || h.src === 0) return;
   const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
   let n = state.nodes.get(h.src);
@@ -126,6 +124,7 @@ function handleNodeStatus(h, p) {
   n.uptime = dv.getUint32(0, true);
   n.health = (p[4] >> 6) & 0x3;
   n.mode = (p[4] >> 3) & 0x7;
+  n.fd = fd;
   n.lastSeen = Date.now();
   renderNodes();
 }
@@ -154,25 +153,26 @@ function handleNodeInfo(h, res) {
   renderNodes();
 }
 
-function handleBfuResponse(h, p) {
+function handleBfuResponse(h, p, fd) {
   if (state.pendingBfu) {
-    state.pendingBfu({ error: p[0], message: new TextDecoder().decode(p.subarray(1)) });
+    state.pendingBfu(decodeBeginFirmwareUpdateResponse(p, fd));
     state.pendingBfu = null;
   }
 }
 
-async function handleReadRequest(h, p, transferId) {
+async function handleReadRequest(h, p, transferId, fd) {
   const u = state.update;
   if (!u || !state.firmware) {
-    await sendReadResponse(h.src, transferId, 2 /* NOT_FOUND */, new Uint8Array(0));
+    await sendReadResponse(h.src, transferId, 2 /* NOT_FOUND */, new Uint8Array(0), fd);
     return;
   }
   if (p.length < 5) return;
   const offset = p[0] + p[1] * 256 + p[2] * 65536 + p[3] * 16777216 + p[4] * 4294967296;
   traceRead(u, offset);
+  if (fd) u.fdReads = (u.fdReads || 0) + 1;
   const bytes = state.firmware.bytes;
   const chunk = bytes.subarray(Math.min(offset, bytes.length), Math.min(offset + READ_CHUNK, bytes.length));
-  await sendReadResponse(h.src, transferId, 0, chunk);
+  await sendReadResponse(h.src, transferId, 0, chunk, fd);
 
   u.served = Math.max(u.served, Math.min(offset + chunk.length, bytes.length));
   u.lastActivity = Date.now();
@@ -182,7 +182,8 @@ async function handleReadRequest(h, p, transferId) {
     u.done = true;
     const secs = (Date.now() - u.startedAt) / 1000;
     log(`Firmware transfer complete (${bytes.length} bytes) in ${secs.toFixed(1)} s — ` +
-        `${(bytes.length / 1024 / secs).toFixed(1)} KB/s, ${u.reads} reads, ${u.retries || 0} retries. ` +
+        `${(bytes.length / 1024 / secs).toFixed(1)} KB/s, ${u.reads} reads (${u.fdReads || 0} CAN FD), ` +
+        `${u.retries || 0} retries. ` +
         'Node is verifying and rebooting.');
     $('status').textContent = 'Transfer complete — node rebooting';
   }
@@ -277,10 +278,20 @@ async function switchToSlcan() {
   }
 
   const cport = await readParam('CAN_SLCAN_CPORT');
-  log(`CAN_SLCAN_CPORT is currently ${cport === null ? 'unknown' : cport}`);
+  if (cport === null) {
+    // ArduPilot 4.7 leaves the port unreadable once an SLCAN session times out (only writes work)
+    log('The FC streams MAVLink but does not answer it. This happens after an earlier SLCAN ' +
+        'session on this port timed out (CAN_SLCAN_TIMOUT): power-cycle the FC, then press Connect.');
+    state.slcan.expectBinary = false;
+    state.mav.dead = true;
+    return false;
+  }
+  log(`CAN_SLCAN_CPORT is currently ${cport}`);
   await setParam('CAN_SLCAN_CPORT', CAN_PORT);
   await setParam(`CAN_P${CAN_PORT}_DRIVER`, 1);
-  await setParam('CAN_SLCAN_TIMOUT', 2);
+  // No timeout: ArduPilot (4.7) never reads MAVLink on the port again after SLCAN times out, so the
+  // port stays SLCAN until reboot and a reconnect finds it with the 'V' probe
+  await setParam('CAN_SLCAN_TIMOUT', 0);
 
   if (cport === 0) {
     // The CAN interface was not routed at boot, so the change only takes effect after a reboot.
@@ -345,6 +356,7 @@ async function connect() {
     state.showAllPorts = false;
     state.slcan = slcan;
     await switchToSlcan();
+    if (state.mav?.dead) throw new Error('flight controller ignores MAVLink input, power-cycle it');
     if (!state.mav?.needsReboot) await slcan.beginSlcan();
   } catch (e) {
     if (e.name === 'NotFoundError' && !state.showAllPorts) {

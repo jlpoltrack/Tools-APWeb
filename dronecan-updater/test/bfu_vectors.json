@@ -1,0 +1,40 @@
+[
+ {
+  "kind": "request",
+  "fd": false,
+  "path": "firmware.bin",
+  "id": 338216191,
+  "frames": [
+   "a5997f6669726d85",
+   "776172652e626925",
+   "6e45"
+  ]
+ },
+ {
+  "kind": "request",
+  "fd": true,
+  "path": "firmware.bin",
+  "id": 338216191,
+  "frames": [
+   "7f0c6669726d776172652e62696e00c5"
+  ]
+ },
+ {
+  "kind": "response",
+  "fd": true,
+  "error": 1,
+  "message": "",
+  "frames": [
+   "0100c5"
+  ]
+ },
+ {
+  "kind": "response",
+  "fd": true,
+  "error": 1,
+  "message": "Refused: busy",
+  "frames": [
+   "011aa4cacceae6cac87440c4eae6f2c5"
+  ]
+ }
+]
